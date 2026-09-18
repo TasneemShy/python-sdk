@@ -27,9 +27,13 @@ New/added tests covering this change (all PASSED):
   request with no timeout is woken with `MCPError(CONNECTION_CLOSED)` instead of hanging.
 - `test_transport_exception_fails_all_concurrent_pending_requests` — one stream fault
   wakes every concurrent in-flight request, not just one (multi-request fan-out).
+  Completion is signalled with an `anyio.Event`, not a polling loop.
 - `test_transport_exception_fails_waiters_before_observer_runs` — waiters are freed
   before the `on_stream_exception` observer is awaited (a deliberately slow observer
-  cannot stall them), and the observer still receives the raw exception untouched.
+  parked on an event cannot stall them), and the observer still receives the raw
+  exception untouched. The test waits on a `waiter_raised` event, so its decisive
+  assertions (`observer_saw == []` before release, `observer_saw == [boom]` after)
+  run deterministically.
 - `test_fail_pending_reports_transport_exception_and_clears_pending` — the error carries
   the transport exception detail and `_pending` is cleared.
 - `test_fail_pending_keeps_existing_outcome_when_waiter_already_resolved` — a waiter that
