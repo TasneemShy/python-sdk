@@ -2061,3 +2061,29 @@ def test_intercept_consumes_acks_for_live_routes_and_leaves_malformed_ones():
     # Events deliver but are never consumed - they still tee to message_handler.
     assert intercept("notifications/tools/list_changed", meta) is False
     assert list(route._pending) == [ToolsListChanged()]  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.anyio
+async def test_default_message_handler_logs_transport_exception(caplog: pytest.LogCaptureFixture):
+    """The default handler surfaces a transport `Exception` at ERROR instead of silently dropping it.
+
+    A fault with no request in flight (e.g. an idle SSE stream dropping) is not failed by the
+    dispatcher's pending-waiter path, so this ERROR log is the only signal it leaves.
+    """
+    from mcp.client.session import _default_message_handler  # pyright: ignore[reportPrivateUsage]
+
+    boom = TimeoutError("sse read timed out")
+    with caplog.at_level("ERROR", logger="client"):
+        await _default_message_handler(boom)
+    assert "transport error surfaced to message handler" in caplog.text
+    assert "sse read timed out" in caplog.text
+
+
+@pytest.mark.anyio
+async def test_default_message_handler_ignores_server_notifications(caplog: pytest.LogCaptureFixture):
+    """A server notification is a no-op for the default handler - no error logging."""
+    from mcp.client.session import _default_message_handler  # pyright: ignore[reportPrivateUsage]
+
+    with caplog.at_level("ERROR", logger="client"):
+        await _default_message_handler(types.ToolListChangedNotification())
+    assert "transport error surfaced to message handler" not in caplog.text

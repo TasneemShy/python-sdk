@@ -2601,3 +2601,106 @@ def test_fail_pending_keeps_existing_outcome_when_waiter_already_resolved():
     assert d._pending == {}  # pyright: ignore[reportPrivateUsage]
     for s in (c2s_send, c2s_recv, s2c_send, s2c_recv, send, recv):
         s.close()
+
+
+@pytest.mark.anyio
+async def test_transport_exception_fails_all_concurrent_pending_requests():
+    """One read-stream fault wakes every in-flight request, not just one."""
+    c2s_send, c2s_recv = anyio.create_memory_object_stream[SessionMessage | Exception](8)
+    s2c_send, s2c_recv = anyio.create_memory_object_stream[SessionMessage | Exception](8)
+
+    client: JSONRPCDispatcher[TransportContext] = JSONRPCDispatcher(c2s_recv, s2c_send)
+    on_request, on_notify = echo_handlers(Recorder())
+    outcomes: dict[str, BaseException] = {}
+    try:
+        async with anyio.create_task_group() as tg:
+            await tg.start(client.run, on_request, on_notify)
+
+            async def call(label: str) -> None:
+                try:
+                    await client.send_raw_request("tools/call", {"name": label})
+                except BaseException as exc:  # noqa: BLE001 - capture whatever the waiter raises
+                    outcomes[label] = exc
+
+            labels = ("a", "b", "c")
+            for label in labels:
+                tg.start_soon(call, label)
+            # Wait until all three requests have been written (so all are pending).
+            with anyio.fail_after(5):
+                for _ in labels:
+                    sent = await s2c_recv.receive()
+                    assert isinstance(sent, SessionMessage)
+
+            await c2s_send.send(TimeoutError("sse read timed out"))
+            with anyio.fail_after(5):
+                while len(outcomes) < len(labels):
+                    await anyio.sleep(0)
+            tg.cancel_scope.cancel()
+    finally:
+        for s in (c2s_send, c2s_recv, s2c_send, s2c_recv):
+            s.close()
+
+    assert set(outcomes) == {"a", "b", "c"}
+    for exc in outcomes.values():
+        assert isinstance(exc, MCPError)
+        assert exc.error.code == CONNECTION_CLOSED
+        assert "sse read timed out" in exc.error.message
+
+
+@pytest.mark.anyio
+async def test_transport_exception_fails_waiters_before_observer_runs():
+    """Waiters are freed before the observer is awaited, so a slow observer can't stall them.
+
+    The observer blocks on an event the test only sets after confirming the waiter has
+    already raised - if failing happened after the observer, this would deadlock.
+    """
+    c2s_send, c2s_recv = anyio.create_memory_object_stream[SessionMessage | Exception](4)
+    s2c_send, s2c_recv = anyio.create_memory_object_stream[SessionMessage | Exception](4)
+
+    release_observer = anyio.Event()
+    observer_saw: list[Exception] = []
+
+    async def slow_observer(exc: Exception) -> None:
+        await release_observer.wait()
+        observer_saw.append(exc)
+
+    client: JSONRPCDispatcher[TransportContext] = JSONRPCDispatcher(
+        c2s_recv, s2c_send, on_stream_exception=slow_observer
+    )
+    on_request, on_notify = echo_handlers(Recorder())
+    outcome: dict[str, BaseException] = {}
+    boom = TimeoutError("sse read timed out")
+    try:
+        async with anyio.create_task_group() as tg:
+            await tg.start(client.run, on_request, on_notify)
+
+            async def call() -> None:
+                try:
+                    await client.send_raw_request("tools/call", {"name": "slow"})
+                except BaseException as exc:  # noqa: BLE001 - capture whatever the waiter raises
+                    outcome["exc"] = exc
+
+            tg.start_soon(call)
+            with anyio.fail_after(5):
+                sent = await s2c_recv.receive()
+                assert isinstance(sent, SessionMessage)
+
+            await c2s_send.send(boom)
+            # The waiter must raise while the observer is still parked.
+            with anyio.fail_after(5):
+                while "exc" not in outcome:
+                    await anyio.sleep(0)
+            assert observer_saw == []  # observer has NOT run yet
+            release_observer.set()
+            with anyio.fail_after(5):
+                while not observer_saw:
+                    await anyio.sleep(0)
+            tg.cancel_scope.cancel()
+    finally:
+        for s in (c2s_send, c2s_recv, s2c_send, s2c_recv):
+            s.close()
+
+    assert isinstance(outcome["exc"], MCPError)
+    assert outcome["exc"].error.code == CONNECTION_CLOSED
+    # The observer still receives the raw transport exception, untouched.
+    assert observer_saw == [boom]

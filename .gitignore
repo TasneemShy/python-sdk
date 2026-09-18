@@ -183,3 +183,6 @@ results/
 
 # conformance CI local runs
 conformance-results/
+
+# Kiro local settings (not part of the SDK)
+.kiro/

@@ -536,10 +536,9 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
         are awaited; any other `await` would head-of-line block the read loop.
         """
         if isinstance(item, Exception):
-            # A transport fault fails every in-flight request now, rather than
-            # leaving each waiter to block until its own `opts["timeout"]`
-            # elapses (or forever, if it has none). Done before the observer
-            # runs so a slow observer can't delay freeing the waiters.
+            # Fail in-flight waiters first, so a slow observer can't delay
+            # freeing them; otherwise each blocks until its own timeout (or
+            # forever, with none).
             self._fail_pending(item)
             if self.on_stream_exception is None:
                 logger.debug("transport yielded exception: %r", item)
@@ -693,10 +692,8 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
     def _fan_out_error(self, error: ErrorData) -> None:
         """Wake every pending `send_raw_request` waiter with `error`.
 
-        Synchronous: callers may be inside a cancelled scope. Idempotent - the
-        `_pending` table is cleared, so a second call is a no-op. A waiter that
-        already holds an outcome (buffer-of-1 full) keeps it: the `WouldBlock`
-        is swallowed rather than clobbering the real response with the signal.
+        Synchronous and idempotent (clears `_pending`). A waiter that already
+        holds an outcome keeps it: the `WouldBlock` is swallowed, not clobbered.
         """
         for pending in self._pending.values():
             try:
@@ -710,13 +707,12 @@ class JSONRPCDispatcher(Dispatcher[TransportT]):
         self._fan_out_error(ErrorData(code=CONNECTION_CLOSED, message="Connection closed"))
 
     def _fail_pending(self, exc: Exception) -> None:
-        """Wake every pending waiter because the read stream yielded a transport fault.
+        """Fail every pending waiter after the read stream yields a transport fault.
 
-        Reported as `CONNECTION_CLOSED` for parity with the EOF path (`send_raw_request`
-        raises `MCPError` either way), but the message carries `exc` so callers can see
-        what actually broke - e.g. an `httpx.ReadTimeout` from a low `sse_read_timeout` -
-        instead of the request hanging until its own timeout. The raw `exc` still reaches
-        any `on_stream_exception` observer untouched.
+        Reported as `CONNECTION_CLOSED` for parity with the EOF path, but the message
+        carries `exc` (e.g. an `httpx.ReadTimeout` from a low `sse_read_timeout`) so the
+        cause is visible instead of the request hanging until its own timeout. The raw
+        `exc` still reaches any `on_stream_exception` observer untouched.
         """
         self._fan_out_error(ErrorData(code=CONNECTION_CLOSED, message=f"Transport error: {exc!r}"))
 
